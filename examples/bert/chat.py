@@ -18,7 +18,7 @@ from dllm.tools.chat import multi_turn_chat, single_turn_generate
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: str = "models/ModernBERT-large/tulu-3-smoltalk/epochs-10-bs-384-len-1024/checkpoint-final"
+    model_name_or_path: str = "dllm-collection/ModernBERT-large-chat-v0"
     seed: int = 42
     chat: bool = True
     visualize: bool = True
