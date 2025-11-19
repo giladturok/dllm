@@ -55,7 +55,10 @@ def get_model(
     try:
         model = transformers.AutoModelForMaskedLM.from_pretrained(model_name_or_path, **params)
     except:
-        model = transformers.AutoModel.from_pretrained(model_name_or_path, **params)
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(model_name_or_path, **params)
+        except:
+            model = transformers.AutoModel.from_pretrained(model_name_or_path, **params)
 
     # --- if quantized, prepare for LoRA / QLoRA training ---
     if load_in_4bit and quant_config is not None:

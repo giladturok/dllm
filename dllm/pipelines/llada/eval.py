@@ -8,6 +8,7 @@ accelerate launch \
     --model_args "pretrained=GSAI-ML/LLaDA-8B-Base,is_check_greedy=False,mc_num=1,max_new_tokens=1024,steps=1024,block_length=32,cfg=0.0"
 """
 
+import math
 from types import SimpleNamespace
 from dataclasses import dataclass
 
@@ -177,6 +178,7 @@ class LLaDAEvalHarness(LM):
 
     @torch.no_grad()
     def get_loglikelihood(self, prefix: torch.Tensor, target: torch.Tensor) -> float:
+        """Compute ELBO, a bound on the true loglikelihood"""
         seq = torch.concatenate([prefix, target])[None, :]
         seq = seq.repeat((self.batch_size, 1)).to(self.device)
         prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
@@ -194,6 +196,63 @@ class LLaDAEvalHarness(LM):
             loss_acc.append(loss.item())
 
         return - sum(loss_acc) / len(loss_acc)
+        
+    def _exact_loglikelihood_step(
+        self, 
+        seq: torch.Tensor, 
+        prompt_index: torch.Tensor, 
+        z_k: torch.Tensor, 
+        block_start: int, 
+        block_end: int
+    ):
+        """Assume batch_size=1"""
+        batch_size, seq_len = seq.shape
+        target_len = seq_len - prompt_index.sum()
+        
+        logits = self.model(z_k).logits # [batch_size, seq_len, vocab_size]
+        token_log_probs = F.log_softmax(logits, dim=-1) # [batch_size, seq_len, vocab_size]
+        confidence_log_probs = torch.max(token_log_probs, dim=-1).values # [batch_size, seq_len]
+        
+        is_mask_token = (z_k == self.mask_id) # [batch_size, seq_len]
+        seq_idx = torch.arange(seq_len, device=seq.device) # [seq_len]
+        is_within_block = (block_start <= seq_idx) & (seq_idx < block_end) # ensures prompt is never evaluated
+        bool_mask = is_mask_token & is_within_block
+        
+        masked_log_probs = torch.where(
+            bool_mask, confidence_log_probs, torch.full_like(confidence_log_probs, float("-inf"))
+        ) # [batch_size, seq_len]
+        greedy_position = masked_log_probs.argmax(dim=-1) # [batch_size]
+        
+        true_log_probs = torch.gather(
+            token_log_probs, dim=-1, index=seq.unsqueeze(-1)
+        ).squeeze(-1) # [batch_size, seq_len]
+        nll_greedy = -true_log_probs[torch.arange(batch_size), greedy_position] # [batch_size]
+        z_k = z_k.clone()  # Avoid in-place modification issues
+        z_k[torch.arange(batch_size), greedy_position] = seq[torch.arange(batch_size), greedy_position]
+        
+        return nll_greedy / target_len, z_k
+    
+    @torch.no_grad()
+    def get_exact_loglikelihood(self, prefix: torch.Tensor, target: torch.Tensor) -> float:
+        """Compute the exact loglikelihood under greedy block-decoding (assumes batch_size=1)"""
+        seq = torch.concatenate([prefix, target])[None, :].to(self.device) # [1, seq_len]
+        prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
+        
+        z_k = torch.full_like(seq, self.mask_id, device=self.device) # [1, seq_len]
+        z_k[:, :len(prefix)] = seq[:, :len(prefix)]  # Keep prefix unmasked
+        nll_block_greedy = torch.tensor([0.0], device=self.device) # []
+        
+        num_blocks = math.ceil(len(target) / self.block_length)
+        for block_idx in range(num_blocks):
+            block_start = len(prefix) + self.block_length * block_idx
+            block_end = len(prefix) + min(self.block_length * (block_idx + 1), len(target))
+            
+            for _ in range(block_start, block_end):
+                nll_step, z_k = self._exact_loglikelihood_step(
+                    seq, prompt_index, z_k, block_start, block_end
+                )
+                nll_block_greedy += nll_step
+        return -nll_block_greedy.item()
 
     @torch.no_grad()
     def suffix_greedy_prediction(self, prefix: torch.Tensor, target: torch.Tensor) -> bool:
@@ -259,6 +318,7 @@ class LLaDAEvalHarness(LM):
                 target = elem["target"]
 
                 ll = self.get_loglikelihood(prefix, target)
+                # ll = self.get_exact_loglikelihood(prefix, target)
 
                 is_target_greedy_dec = self.suffix_greedy_prediction(prefix, target)
 
